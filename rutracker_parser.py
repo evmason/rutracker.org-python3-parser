@@ -1,380 +1,382 @@
-# -*- coding: utf-8 -*-
-import sys
-reload(sys)
-sys.setdefaultencoding('utf-8')
-
 """
-Copyright (c) 2014, Evgeny Mason.
+rutracker.org - python3-parser
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
+rutracker_parser - позволяет работать с популярным торрент трекером rutracker.org из Python3
 """
 
-import urllib, urllib2, cookielib
-import pycurl
-import cStringIO
 import re
-import lxml.html as lh
-from termcolor import colored
 
-def http_get(d,history=[]):
-	buf=cStringIO.StringIO()
-	headers=cStringIO.StringIO()
+import requests
+import bs4
+import collections
 
-	url=d['url']
+import http.cookiejar
+from urllib.parse import urlparse, parse_qs
 
-	c=pycurl.Curl()
-	c.setopt(c.URL,url)
-	c.setopt(c.WRITEFUNCTION,buf.write)
-	c.setopt(c.HEADERFUNCTION,headers.write)
-	c.setopt(c.CONNECTTIMEOUT,15)
-	c.setopt(c.TIMEOUT,18)
+import base64
+import time
 
-	# это POST запрос
-	if "postfields" in d.keys():
-		c.setopt(c.POST,True)
-		c.setopt(c.POSTFIELDS,d['postfields'])
+import logging
+#logging.basicConfig(level=logging.DEBUG, format='%(asctime)s: [%(levelname)s] %(message)s', datefmt='%m/%d/%Y %H:%M:%S')
 
-	c.setopt(c.COOKIEFILE,"cookie.txt")
-	c.setopt(c.COOKIEJAR,"cookie.txt")
+class rutracker_parser():
+	# путь к файлу cookies
+	cookie_file_path = 'rutracker.cookie.txt'
 
-	if "verbose" in d.keys() and d['verbose']:
-		c.setopt(c.VERBOSE,True)
-	else:
-		d['verbose']=False
+	# логин для входа
+	username = ''
 
-	c.setopt(pycurl.HTTPHEADER, [
-		"User-Agent: 10.0.648.205 Mac OS X — Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10_6_7; en-US) AppleWebKit/534.16 (KHTML, like Gecko) Chrome/10.0.648.205 Safari/534.16"
-	])
-	c.perform()
+	# паролья для входа
+	password = ''
 
-	default_charset="utf-8"
-	charset="utf-8"
-	m=re.search("(<meta[^>]*content *= *['\"][^'\"]*charset *= *([^=]+)['\"][^>]*>)",buf.getvalue().decode('utf8',"ignore"))
-	if m:
-		charset=m.group(2)
+	# сервис для работы с каптчей
+	# можно использовать альтернативные сервисы заменив URL, API у них идентичны
+	captcha_solve_config = {
+		'api_url_put': 'http://antigate.com/in.php',
+		'api_url_result': 'http://antigate.com/res.php',
+		'key': ''
+	}
+
+	# основные HTTP заголовки
+	headers = {
+		'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+		'Connection': 'close',
+		'Accept-Language': 'ru-RU,ru;q=0.8,en-US;q=0.6,en;q=0.4',
+		'Accept-Encoding': 'gzip, deflate, lzma, sdch',
+		'User-Agent': 'Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2228.0 Safari/537.36',
+	}
+
+	def __init__(self, **params):
+		if 'username' in params:
+			self.username = params['username']
+
+		if 'password' in params:
+			self.password = params['password']
+
+		if 'captcha_solve_api_key' in params:
+			self.captcha_solve_config['key'] = params['captcha_solve_api_key']
+
+		self.session = requests.Session()
+
+	# чтение cookies
+	def cookie_read(self):
+		self.session.cookies = http.cookiejar.LWPCookieJar(self.cookie_file_path)
+		try:
+			self.session.cookies.load(ignore_discard=True)
+		except:
+			pass
+
+	# запись cookies
+	def cookie_write(self):
+		self.session.cookies.save(ignore_discard=True)
+
+	# пытаемся разгадать каптчу
+	def solve_captcha(self, html):
+		result = {}
+
+		match = re.search('<input[^>]*name="cap_sid"[^>]*value="([^"]+)"[^>]*>', html)
+		if match is not None:
+			result['cap_sid'] = match.group(1)
+		else:
+			return False
+
+		match = re.search('<input[^>]*name="(cap_code_[^"]+)"[^>]*value="[^"]*"[^>]*>', html)
+		if match is not None:
+			result['cap_code_name'] = match.group(1)
+		else:
+			return False
+
+		match = re.search('<img[^>]*src="([^"]+/captcha/[^"]+)"[^>]*>', html)
+		if match is not None:
+			captcha_img_url = match.group(1)
+		else:
+			return False
+
+		# скачиваем изображение каптчи
+		response = requests.get(
+			captcha_img_url, 
+			timeout=60, 
+			stream=True, 
+			verify=False, 
+			headers=self.headers
+		)
+		if response.status_code != 200:
+			return False
+		captcha_img_data = response.raw.read()
+
+		post_data = {
+			'method': 'base64',
+			'key': self.captcha_solve_config['key'],
+			'phrase': 0,
+			'regsense': 0,
+			'numeric': 0,
+			'min_len': 0,
+			'max_len': 0,
+			'body': base64.b64encode(captcha_img_data),
+		}
+
+		# отправляем каптчу в сервис распознавания
+		response = requests.post(
+			self.captcha_solve_config['api_url_put'],
+			data=post_data,
+			timeout=60,
+			stream=True,
+			verify=False,
+			headers=self.headers
+		)
+
+		if response.status_code != 200 or 'OK|' not in response.text:
+			return False
+
+		status, service_captcha_id = response.text.split('|')
 	
-	if default_charset != charset:
-		html=buf.getvalue().decode(charset).encode(default_charset).replace(m.group(1),'<meta http-equiv="Content-Type" content="text/html; charset='+default_charset+'" />')
-	else:
-		html=buf.getvalue()
+		# стучимся в сервис пока не получим содержимое каптчи
+		i = 0
+		while True:
+			# 5мин. не можем разгадать каптчу
+			# пора бы остановиться...
+			if i == 300:
+				break
 
-	history.append({
-		"http_code":c.getinfo(pycurl.HTTP_CODE),
-		"headers":headers.getvalue(),
-		"html":html,
-		"charset":charset
-	})
+			logging.debug('Try to get captcha solve result...')
 
-	d['level']=len(history)
-
-	if(len(history)==10):
-		return history
-	
-	redirect_uri=""
-
-	# 300й статус ответа, значит надо делать редирект
-	if(str(c.getinfo(pycurl.HTTP_CODE))[:2]=="30"):
-		m=re.search('Location: *([^\n]+)',headers.getvalue())
-
-		if not m:
-			return False;
-
-		redirect_uri=m.group(1)
-	
-	# проверяем, может быть есть meta тег для редиректа
-	if redirect_uri == "":
-		m2=re.search("<meta[^>]*http-equiv *= *['\"]Refresh['\"][^>]*URL *= *([^=>\"']+)[^>]*>",html)
-		if m2:
-			redirect_uri=m2.group(1).strip()
-
-	# домебаляем в начало URL домен, если он не указан
-	if(redirect_uri
-		and redirect_uri[:5]!="http:" 
-		and redirect_uri[:6]!="https:"):
-			m=re.search('(https?://)?([^/]+)',url)
-			if(m):
-				main_domain=m.group(2)
-				redirect_uri="http://"+main_domain+"/"+redirect_uri.lstrip("/");
-	if redirect_uri:
-		http_get({
-			"url":redirect_uri,
-			"level":d['level'],
-			"verbose":d['verbose']
-		},history)
-
-	c.close()
-	buf.close()
-	headers.close()
-
-	return {
-		"history":history
-	};
-
-class rutrackerBot:
-	debug=False
-	username=""
-	password=""
-	index_url="http://rutracker.org/forum/index.php"
-
-	# инициализация
-	def __init__(self,d):
-		if "username" in d.keys():
-			self.username=d['username']
-
-		if "password" in d.keys():
-			self.password=d['password']
-
-		if "debug" in d.keys():
-			self.debug_file=open("rutracker-parser-debug.txt","a")
-			self.debug=d['debug']
-
-	def is_logged_in(self,html):
-		if html != "":
-			if "login_username" not in html and "login_password" not in html:
-				return True
-
-		return False
-
-	def get_magnet_link(self,btih):
-		return "magnet:?xt=urn:btih:"+btih
-
-	def is_ready_for_download(self,status):
-		if status == "проверено" or status == "checked":
-			return True
-		return False
-
-	# конвертирует статус торрента на английский
-	def torrent_status_translate(self,status_ru):
-		status_ru=status_ru.strip()
-		torrent_statuses={
-			u"не проверено":"not tested",
-			u"проверяется":"verified",
-			u"проверено":"checked",
-			u"недооформлено":"not fully decorated",
-			u"не оформлено":"not decorated",
-			u"повтор":"duplicate",
-			u"закрыто правообладателем":"closed by rightholder",
-			u"закрыто":"closed",
-			u"временная":"temporal",
-			u"поглощено":"absorbed",
-			u"сомнительно":"doubtfully",
-			u"премодерация":"premoderation"
-		};
-
-		if status_ru in torrent_statuses.keys():
-			return torrent_statuses[status_ru]
-
-		return False
-
-	# получаем конкретный топик
-	def get_topic(self,topic_id):
-		response=http_get({
-			"url":self.get_topic_link(topic_id)
-		})
-
-		if(response['history'][-1]['http_code'] == 200):
-			if not self.is_logged_in(response['history'][-1]['html']):
-				if not self.login():
-					return False
-				else:
-					return self.get_forum_topics(forum_id,page)
-
-			dom=lh.fromstring(response['history'][-1]['html'])
-
-			topic_data={};
-
-			# получаем заголовок
-			h1=dom.cssselect("h1.maintitle > a")
-			topic_data['title']=h1[0].text;
-
-			if len(dom.cssselect("var.postImg[title!='']")) > 0:
-				topic_data['main_picture']=dom.cssselect("var.postImg")[0].attrib['title']
+			response = requests.get(
+				'%s?key=%s&id=%s&action=get' % (self.captcha_solve_config['api_url_result'], self.captcha_solve_config['key'], service_captcha_id),
+				timeout=60, 
+				stream=True, 
+				verify=False, 
+				headers=self.headers
+			)
 			
-			if len(dom.cssselect("span.seed > b"))>0:
-				topic_data['seeders']=dom.cssselect("span.seed > b")[0].text
-
-			if len(dom.cssselect("span.leech > b"))>0:
-				topic_data['leechers']=dom.cssselect("span.leech > b")[0].text
-			
-			if len(dom.cssselect("div.post_body"))>0:
-				topic_data['text']=dom.cssselect("div.post_body")[0].text_content()
-
-			topic_data['torrent_file_link']=self.get_torrent_link(topic_id)
-
-			if len(dom.cssselect("span#tor-hash"))>0:
-				topic_data['torrent_hash']=dom.cssselect("span#tor-hash")[0].text_content()
-
-			if topic_data['torrent_hash'] != "":
-				topic_data['torrent_magnet_link']=self.get_magnet_link(topic_data['torrent_hash'])
-			
-			if len(dom.cssselect(".tor-icon + a"))>0:
-				topic_data['torrent_status_ru']=dom.cssselect(".tor-icon + a")[0].text_content()
-
-			if topic_data['torrent_status_ru'] != "":
-				topic_data['torrent_status']=self.torrent_status_translate(topic_data['torrent_status_ru'])
-			
-			if topic_data['torrent_status'] != "":
-				topic_data['is_ready_for_download']=self.is_ready_for_download(topic_data['torrent_status'])
-
-			return topic_data
-
-		return False
-
-	# получаем список топиков по ID форума
-	def get_forum_topics(self,forum_id,page=1):
-		response=http_get({
-			"url":self.get_forum_link(forum_id)
-		})
-
-		topics=[]
-		
-		if(response['history'][-1]['http_code'] == 200):
-			if not self.is_logged_in(response['history'][-1]['html']):
-				if not self.login():
-					return False
-				else:
-					return self.get_forum_topics(forum_id,page)
-
-			dom=lh.fromstring(response['history'][-1]['html'])
-			for tr in dom.cssselect("tr.hl-tr"):
-				a=tr.cssselect("a.torTopic")
-				if len(a) != 1: continue
-
-				seeders=0
-				leechers=0
-				if len(tr.cssselect("span.seedmed b")) != 1: continue
+			if 'OK|' in response.text:
+				status, result['captcha_code'] = response.text.split('|')
 				
-				seeders=tr.cssselect("span.seedmed b")[0].text.strip()
-				leechers=tr.cssselect("span.leechmed b")[0].text.strip()
+				return result
 
-				topic_id=a[0].attrib['href'].split("=")[-1]
-				topics.append({
-					"seeders":int(seeders),
-					"leechers":int(leechers),
-					"id":int(topic_id),
-					"title":a[0].text
-				})
-				
-			return topics
+			time.sleep(1)
+
+			i += 1
+
+		return False
+
+	# по содержимому страницу определяет залогинен пользователь или нет
+	def is_login_check(self, html):
+		return 'logged-in-as-cap' in html
+
+	# логинимся
+	def login(self, captcha_info=None):
+		params = {}
+
+		if captcha_info is not None:
+			params['captcha_info'] = captcha_info
+
+		return self.request('login', **params)
+
+	# отправляем запрос на rutracker
+	def request(self, method_name, **request_params):
+		# читаем куки
+		self.cookie_read()
+
+		shema = 'get'
+		if method_name == 'forums_list':
+			url = 'http://rutracker.org/forum/index.php'
+		elif method_name == 'login':
+			shema = 'post'
+			url = 'http://login.rutracker.org/forum/login.php'
+			post_data = {
+				'login_username': self.username,
+				'login_password': self.password,
+				'login': 'вход',
+			}
+
+			# добавляем в POST данные код каптчи
+			if 'captcha_info' in request_params:
+				post_data['cap_sid'] = request_params['captcha_info']['cap_sid']
+				post_data[request_params['captcha_info']['cap_code_name']] = request_params['captcha_info']['captcha_code']
+		elif method_name == 'topics_list':
+			pagination_start = 0
+			if 'page' in request_params:
+				pagination_start = 50 * (int(request_params['page']) - 1)
+
+			if 'forum_id' in request_params:
+				forum_id = request_params['forum_id']
+			else:
+				logging.critical('Forum ID not set')
+				return False
+
+			url = 'http://rutracker.org/forum/viewforum.php?f=%s&start=%s' % (forum_id, pagination_start)
+		elif method_name == 'topic':
+			url = 'http://rutracker.org/forum/viewtopic.php?t=5117006'
 		else:
+			logging.warning('Unknown request method!')
 			return False
 
-	# получает ID форума, и возвращает кол. страниц
-	def get_forum_pages_num(self,forum_id):
-		response=http_get({
-			"url":self.get_forum_link(forum_id)
-		})
+		logging.debug('REQUEST URL: %s' % url)
 
-		if(response['history'][-1]['http_code'] == 200):
-			dom=lh.fromstring(response['history'][-1]['html'])
-			return dom.cssselect("#pagination b:last-child")[0].text.strip()
+		# отправляем запрос
+		if shema == 'get':
+			response = self.session.get(url, timeout=60, stream=True, verify=False, headers=self.headers)
 		else:
-			return False
+			response = self.session.post(url, data=post_data, timeout=60, stream=True, verify=False, headers=self.headers)
 
-	# генерирует ссылку на торрент
-	def get_torrent_link(self,topic_id):
-		if topic_id == 0 or topic_id == "": return False
+		# преображаем контент в кодировку UTF-8
+		if ('content-type' in response.headers
+				and ('html' in response.headers['Content-Type']
+					or 'gzip' in response.headers['Content-Type'])):
+				content_raw = response.raw.read(decode_content=True)
+				content_decoded = content_raw.decode('windows-1251')
 
-		return "http://dl.rutracker.org/forum/dl.php?t="+str(topic_id)
+		if self.is_login_check(content_decoded) is False:
+			if method_name == 'login':
+				logging.critical('Bad username or password!')
 
-	# генерирует ссылку на топик
-	def get_topic_link(self,topic_id):
-		if topic_id == 0 or topic_id == "": return False
+				if 'cap_code_' in content_decoded and self.captcha_solve_config['key'] != '':
+					# это каптча! попробуем ее решить 5 раз
+					for attempt in range(1, 5):
+						captcha_info = self.solve_captcha(content_decoded)
 
-		return "http://rutracker.org/forum/viewtopic.php?t="+str(topic_id)
+						if captcha_info is not False:
+							break
 
-	# генерирует ссылку на форум
-	def get_forum_link(self,forum_id):
-		if forum_id == 0 or forum_id == "": return False
+					if captcha_info is not False:
+						# еще раз пробуем войти, но тереть с каптчей
+						if self.login(captcha_info=captcha_info) is False:
+							return False
+					else:
+						# всетаки каптчу решить не удалось
+						return False
+				else:
+					# каптчи нет, и войти не получается.. значит другие проблемы..
+					return False
+			else:
+				logging.debug('Try to login...')
 
-		return "http://rutracker.org/forum/viewforum.php?f="+str(forum_id)
+				if self.login() is False:
+					return False
 
-	# возвращает список форумов (название, id, ссылка)
-	def get_forum_structure(self):
-		response=http_get({
-			"url":"http://rutracker.org/forum/search.php"
-		})
-
-		if(response['history'][-1]['http_code'] == 200):
-			options=[]
-			dom=lh.fromstring(response['history'][-1]['html'])
-			for option in dom.cssselect("select[name='f[]'] option"):
-
-				if option.attrib['value'] == "" or option.attrib['value'] == 0: continue
-
-				options.append({
-					"value":option.attrib['value'],
-					"title":option.text,
-					"link":self.get_forum_link(option.attrib['value'])
-				})
-
-				return options;
-		else:
-			return False
-
-	# метод отвечает за вход на rutracker
-	def login(self):
-		response=http_get({
-			"url":self.index_url
-		});
-
-		if response['history'][-1]['http_code'] != 200:
-			return False
-
-		if type(response) is dict:
-			html=response['history'][-1]['html']
-
-			if self.debug:
-				self.debug_file.write(html)
-
-			if html.find("profile.php?mode=editprofile") > 0:
-				return True
-			
-			rutracker_login_form_data={}
-			dom=lh.fromstring(html)
-			rutracker_login_form_data['form_action']=""
-			for form in dom.cssselect("form"):
-				if ("action" in form.attrib.keys()):
-					rutracker_login_form_data['form_action']=form.attrib['action']
-
-				if "forum/login.php" not in rutracker_login_form_data['form_action']:
-					continue
-
-				rutracker_login_form_data['fields_data']=""
-				for html_input in form.cssselect("input"):
-
-					if(html_input.attrib['name'] == "login_username"):
-						html_input.attrib['value']=self.username
-
-					if(html_input.attrib['name'] == "login_password"):
-						html_input.attrib['value']=self.password
-
-					if "name" in html_input.attrib.keys() and "value" in html_input.attrib.keys():
-						rutracker_login_form_data['fields_data']+="&"+html_input.attrib['name']+"="+html_input.attrib['value'].encode("cp1251")
+				return self.request(method_name, **request_params)
 		
-		if type(rutracker_login_form_data) is dict:
-			post_response=http_get({
-				"url":rutracker_login_form_data['form_action'],
-				"postfields":rutracker_login_form_data['fields_data']
-			})
+		# записываем в cookies
+		self.cookie_write()
 
-			if self.debug:
-				self.debug_file.write(post_response['history'][-1]['html'])
+		soup = bs4.BeautifulSoup(content_decoded, "html.parser")
 
-		return True
+		result = collections.OrderedDict()
+
+		if method_name == 'forums_list':
+			# парсим основные категории
+			for category in soup.select('#forums_wrap div.category'):
+				category_title = category.select('h3.cat_title a')
+				category_id = category_title[0].attrs['href'].split('c=')[-1]
+				
+				result[category_id] = {
+					'title': category_title[0].text,
+					'href': category_title[0].attrs['href'],
+					'childs': collections.OrderedDict(),
+				}
+
+				# парсим корневые разделы форумов
+				for root_forum in category.select('table.forums tr'):
+					root_forum_title = root_forum.select('h4.forumlink a')
+					forum_id = self.forum_id_from_href(root_forum_title[0].attrs['href'])
+
+					result[category_id]['childs'][forum_id] = {
+						'title': root_forum_title[0].text,
+						'id': self.forum_id_from_href(root_forum_title[0].attrs['href']),
+						'childs': collections.OrderedDict(),
+					}
+
+					for sub_forum in root_forum.select('.subforums .sf_title a[href^=viewforum]'):
+						sub_forum_id = self.forum_id_from_href(sub_forum.attrs['href'])
+
+						result[category_id]['childs'][forum_id]['childs'][sub_forum_id] = {
+							'title': sub_forum.text,
+							'id': sub_forum_id,
+						}
+
+		elif method_name == 'topics_list':
+			# парсим список топиков
+			result['topics'] = collections.OrderedDict()
+			for topic in soup.select('tr.hl-tr'):
+				topic_title = topic.select('a.tt-text')
+
+				topic_id = self.topic_id_from_href(topic_title[0].attrs['href'])
+				result['topics'][topic_id] = {
+					'id': topic_id,
+					'title': topic_title[0].text,
+				}
+
+				topic_seedmed = topic.select('span.seedmed')
+				if len(topic_seedmed) > 0:
+					result['topics'][topic_id]['seedmed'] = topic_seedmed[0].text
+
+				topic_leechmed = topic.select('span.leechmed')
+				if len(topic_leechmed) > 0:
+					result['topics'][topic_id]['leechmed'] = topic_leechmed[0].text
+
+				f_dl = topic.select('div.small a.f-dl')
+				if len(f_dl) > 0:
+					result['topics'][topic_id]['torrent_data_size'] = f_dl[0].text
+					result['topics'][topic_id]['torrent_download_url'] = f_dl[0].attrs['href']
+
+			# парсим пегинацию
+			current_page = soup.select('.bottom_info #pagination p[style*=right] b')
+			
+			if len(current_page) > 0:
+				result['pagination'] = collections.OrderedDict()
+
+				result['pagination']['current_page'] = int(current_page[0].text)
+
+				for pagination_item in soup.select('.bottom_info #pagination p[style*=right] a[href^=viewforum]'):
+					if str.isnumeric(pagination_item.text):
+						result['pagination']['max_page'] = int(pagination_item.text)
+
+				if result['pagination']['max_page'] < result['pagination']['current_page']:
+					del(result['pagination']['max_page'])
+
+		elif method_name == 'topic':
+			topic_title = soup.select('h1.maintitle')
+			result['title'] = topic_title[0].text
+
+			topic_main_post_body = soup.select('table#topic_main .message .post_body')
+
+			# получаем тело первого поста
+			main_post_body = str(topic_main_post_body[0]).split('<div class="spacer_12"></div>')[0]
+			
+			# заменяем <var теги на <img
+			main_post_body = re.sub('<var([^>]*)title="([^"]+)"([^>]*)>','<img\\1src="\\2"\\3>', main_post_body)
+			result['main_post_body'] = main_post_body.replace('</var>', '')
+
+			attach = topic_main_post_body[0].select('table.attach')
+			if len(attach) > 0:
+				torrent_hash = attach[0].select('#tor-hash')
+				if len(torrent_hash) > 0:
+					result['torrent_hash'] = torrent_hash[0].text
+
+				torrent_download_url = attach[0].select('p a.dl-stub.dl-link')
+				if len(torrent_download_url) > 0:
+					result['torrent_download_url'] = torrent_download_url[0].attrs['href']
+
+		return result
+
+	# извлекает ID форума из URL на форум
+	def forum_id_from_href(self, href):
+		try:
+			variables = parse_qs(href.split('?')[1])
+
+			return int(variables['f'][0])
+		except:
+			pass
+
+		return False
+
+	# извлекает ID топика из URL на топик
+	def topic_id_from_href(self, href):
+		try:
+			variables = parse_qs(href.split('?')[1])
+
+			return int(variables['t'][0])
+		except:
+			pass
+
+		return False
