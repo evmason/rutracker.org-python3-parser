@@ -1,4 +1,10 @@
-RuTracker.org-python-parser
+RuTracker.org парсер на python3
 ===========================
 
-Parser in Python to work with Russian torrent tracker http://rutracker.org/
+Парсер для популярного трекера http://rutracker.org/
+
+Возможности:
+- получение (с сохранением структуры) перечня категорий, форумов
+- получение списка топиков
+- получение информации о конкретном топике
+- вход с функцией расшифровки каптчи
